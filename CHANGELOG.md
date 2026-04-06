@@ -1,5 +1,11 @@
 # Changelog
 
+## Upcoming version
+
+### Added
+
+- \[[#375](https://github.com/rust-vmm/vm-memory/pull/375)\] `mmap/unix.rs`: Add `with_minimum_alignment` to `MmapRegionBuilder`
+
 ## 0.18.0
 
 ### Changed
