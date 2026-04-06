@@ -40,14 +40,25 @@ pub enum Error {
     /// The `mmap` call returned an error.
     #[error("{0}")]
     Mmap(io::Error),
+    /// Invalid aligment specified.
+    #[error("The minimum alignment is not a power of two and at least the system page size")]
+    InvalidAlignment,
 }
 
 pub type Result<T> = result::Result<T, Error>;
+
+/// Retrieve the system page size from sysconf
+fn system_page_size() -> usize {
+    // SAFETY: Safe because this call just returns the page size and doesn't have any side
+    // effects.
+    unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize }
+}
 
 /// A factory struct to build `MmapRegion` objects.
 #[derive(Debug)]
 pub struct MmapRegionBuilder<B = ()> {
     size: usize,
+    alignment: usize,
     prot: i32,
     flags: i32,
     file_offset: Option<FileOffset>,
@@ -73,6 +84,7 @@ impl<B: Bitmap> MmapRegionBuilder<B> {
     pub fn new_with_bitmap(size: usize, bitmap: B) -> Self {
         MmapRegionBuilder {
             size,
+            alignment: system_page_size(),
             prot: 0,
             flags: libc::MAP_ANONYMOUS | libc::MAP_PRIVATE,
             file_offset: None,
@@ -92,6 +104,17 @@ impl<B: Bitmap> MmapRegionBuilder<B> {
     pub fn with_mmap_flags(mut self, flags: i32) -> Self {
         self.flags = flags;
         self
+    }
+
+    /// Create the `MmapRegion` object with the specified minimum alignment.
+    /// `min_align` must be a power of two and at least the system page size.
+    pub fn with_minimum_alignment(mut self, min_align: usize) -> Result<Self> {
+        if !self.alignment.is_power_of_two() || self.alignment < system_page_size() {
+            return Err(Error::InvalidAlignment);
+        }
+
+        self.alignment = min_align;
+        Ok(self)
     }
 
     /// Create the `MmapRegion` object with the specified `file_offset`.
@@ -136,18 +159,74 @@ impl<B: Bitmap> MmapRegionBuilder<B> {
         };
 
         #[cfg(not(miri))]
-        // SAFETY: This is safe because we're not allowing MAP_FIXED, and invalid parameters
-        // cannot break Rust safety guarantees (things may change if we're mapping /dev/mem or
-        // some wacky file).
-        let addr = unsafe {
-            libc::mmap(
-                null_mut(),
-                self.size,
-                self.prot,
-                self.flags,
-                fd,
-                offset as libc::off_t,
-            )
+        let addr = {
+            // To support alignment, first reserve a sufficiently large region of address space
+            // using `MAP_NORESERVE`, and then find and place the real mapping at the aligned
+            // sub-region contained within via `MAP_FIXED`. Then free the excess.
+            let page_aligned_size = self.size.next_multiple_of(system_page_size());
+            let va_reserved_size = page_aligned_size + self.alignment;
+
+            // SAFETY: Calling mmap with correct arguments to reserve virtual address space.
+            let va_reserved_addr = unsafe {
+                libc::mmap(
+                    null_mut(),
+                    va_reserved_size,
+                    libc::PROT_NONE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+                    -1, // fd for MAP_ANONYMOUS
+                    0,  // no offset
+                )
+            };
+
+            if va_reserved_addr == libc::MAP_FAILED {
+                return Err(Error::Mmap(io::Error::last_os_error()));
+            }
+
+            let va_reserved_addr = va_reserved_addr as usize;
+            let aligned_addr = va_reserved_addr.next_multiple_of(self.alignment);
+
+            // Need to free the extra address space later - calculate the ranges
+            let va_prefix_size = aligned_addr - va_reserved_addr;
+            let va_suffix_addr = (aligned_addr + page_aligned_size) as *mut libc::c_void;
+            let va_suffix_size = va_reserved_size - va_prefix_size - page_aligned_size;
+            let va_reserved_addr = va_reserved_addr as *mut libc::c_void;
+
+            // Place the actual mapping within the reserved region.
+            // SAFETY: This is safe because we're not allowing MAP_FIXED, and invalid parameters
+            // cannot break Rust safety guarantees (things may change if we're mapping /dev/mem or
+            // some wacky file).
+            let addr = unsafe {
+                libc::mmap(
+                    aligned_addr as *mut libc::c_void,
+                    // This is safe even if `self.size != page_aligned_size`. The mapping
+                    // happens at the page-granularity, so it is still replaced.
+                    self.size,
+                    self.prot,
+                    self.flags | libc::MAP_FIXED, // Legal since we already reserved VA space
+                    fd,
+                    offset as libc::off_t,
+                )
+            };
+
+            // Don't leak the VA.
+            if addr == libc::MAP_FAILED {
+                let e = io::Error::last_os_error();
+                // SAFETY: Calling as documented.
+                unsafe { libc::munmap(va_reserved_addr, va_reserved_size) };
+                return Err(Error::Mmap(e));
+            }
+
+            if va_prefix_size > 0 {
+                // SAFETY: Calling as documented.
+                unsafe { libc::munmap(va_reserved_addr, va_prefix_size) };
+            }
+
+            if va_suffix_size > 0 {
+                // SAFETY: Calling as documented.
+                unsafe { libc::munmap(va_suffix_addr, va_suffix_size) };
+            }
+
+            addr
         };
 
         #[cfg(not(miri))]
@@ -163,12 +242,15 @@ impl<B: Bitmap> MmapRegionBuilder<B> {
         // Miri does not support the mmap syscall, so we use rust's allocator for miri tests
         #[cfg(miri)]
         let addr = unsafe {
-            std::alloc::alloc_zeroed(std::alloc::Layout::from_size_align(self.size, 8).unwrap())
+            std::alloc::alloc_zeroed(
+                std::alloc::Layout::from_size_align(self.size, self.alignment).unwrap(),
+            )
         };
 
         Ok(MmapRegion {
             addr: addr as *mut u8,
             size: self.size,
+            alignment: self.alignment,
             bitmap: self.bitmap,
             file_offset: self.file_offset,
             prot: self.prot,
@@ -179,19 +261,17 @@ impl<B: Bitmap> MmapRegionBuilder<B> {
     }
 
     fn build_raw(self) -> Result<MmapRegion<B>> {
-        // SAFETY: Safe because this call just returns the page size and doesn't have any side
-        // effects.
-        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
         let addr = self.raw_ptr.unwrap();
 
         // Check that the pointer to the mapping is page-aligned.
-        if (addr as usize) & (page_size - 1) != 0 {
+        if (addr as usize) & (self.alignment - 1) != 0 {
             return Err(Error::InvalidPointer);
         }
 
         Ok(MmapRegion {
             addr,
             size: self.size,
+            alignment: self.alignment,
             bitmap: self.bitmap,
             file_offset: self.file_offset,
             prot: self.prot,
@@ -215,6 +295,7 @@ impl<B: Bitmap> MmapRegionBuilder<B> {
 pub struct MmapRegion<B = ()> {
     addr: *mut u8,
     size: usize,
+    alignment: usize,
     bitmap: B,
     file_offset: Option<FileOffset>,
     prot: i32,
@@ -323,6 +404,11 @@ impl<B: Bitmap> MmapRegion<B> {
         self.size
     }
 
+    /// Returns the minimum alignment this region is guaranteed to have.
+    pub fn minimum_alignment(&self) -> usize {
+        self.alignment
+    }
+
     /// Returns information regarding the offset into the file backing this region (if any).
     pub fn file_offset(&self) -> Option<&FileOffset> {
         self.file_offset.as_ref()
@@ -425,7 +511,7 @@ impl<B> Drop for MmapRegion<B> {
                 #[cfg(miri)]
                 std::alloc::dealloc(
                     self.addr,
-                    std::alloc::Layout::from_size_align(self.size, 8).unwrap(),
+                    std::alloc::Layout::from_size_align(self.size, self.alignment).unwrap(),
                 );
             }
         }
@@ -615,6 +701,52 @@ mod tests {
         assert_eq!(r.prot(), libc::PROT_READ | libc::PROT_WRITE);
         assert_eq!(r.flags(), libc::MAP_NORESERVE | libc::MAP_PRIVATE);
         assert!(!r.owned());
+    }
+
+    #[test]
+    fn test_mmap_alignment() {
+        let page_size = system_page_size();
+        let region_size = page_size - 1;
+
+        let builder = MmapRegionBuilder::new_with_bitmap(region_size, ());
+        matches!(
+            builder.with_minimum_alignment(page_size + 1),
+            Err(Error::InvalidAlignment)
+        );
+
+        let builder = MmapRegionBuilder::new_with_bitmap(region_size, ());
+        matches!(
+            builder.with_minimum_alignment(page_size - 1),
+            Err(Error::InvalidAlignment)
+        );
+
+        let builder = MmapRegionBuilder::new_with_bitmap(region_size, ());
+        matches!(
+            builder.with_minimum_alignment(page_size * 3),
+            Err(Error::InvalidAlignment)
+        );
+
+        let builder = MmapRegionBuilder::new_with_bitmap(region_size, ());
+        let mapping = builder.build().unwrap();
+
+        assert_eq!(mapping.minimum_alignment(), page_size);
+        // Technically we can get lucky and have the alignment naturally fall on a 1 GiB boundary,
+        // so we can't assert that we DON'T here.
+    }
+
+    #[test]
+    #[cfg(not(miri))] // 1 GiB alignment is too big for Miri
+    fn test_mmap_alignment_1gib() {
+        let page_size = system_page_size();
+        let region_size = page_size - 1;
+
+        let align_1gb = 1024 * 1024 * 1024; // 1 GiB
+        let builder = MmapRegionBuilder::new_with_bitmap(region_size, ())
+            .with_minimum_alignment(align_1gb)
+            .unwrap();
+        let mapping = builder.build().unwrap();
+        assert_eq!(mapping.minimum_alignment(), align_1gb);
+        assert_eq!((mapping.as_ptr() as usize) % align_1gb, 0);
     }
 
     #[test]
